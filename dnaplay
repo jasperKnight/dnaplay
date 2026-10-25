@@ -1,0 +1,1358 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+dnaplay  -  "Base Pair Binder", a terminal game for the genomics server.
+
+A DNA duplex scrolls in opposite directions near the top and bottom of the
+screen. Pilot a short PRIMER (3-5 bases) through the field and fly into the
+matching strand to bind.
+
+    ARROWS/WASD steer   SPACE thrust   1 Helicase   2 Polymerase   P pause   Q quit
+
+Scoring: you start at 100. A correct impact scores 3 per G-C pair and 2 per
+A-T pair (their real hydrogen-bond counts) times your combo. A wrong impact
+costs 5; a site that escapes costs 15 (double if mutated). Score <= 0 ends
+the game and your PEAK score goes on the board.
+The strand speeds up as you score and slows down again when you slip.
+
+Every 3 bases you bind form a codon -> an amino acid.  A stop codon (TAA, TAG,
+TGA) releases the protein for a bonus.
+
+Options:  --daily     today's shared challenge strand
+          --scores    print the scoreboard and exit
+          --tutorial  show the tutorial first
+
+Scores:   /var/lib/genomics-game/scores.log  (override with DNAPLAY_DIR)
+Python 3 standard library only.  Never needs root.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import fcntl
+import itertools
+import math
+import os
+import pwd
+import random
+import re
+import select
+import shutil
+import signal
+import stat
+import sys
+import termios
+import textwrap
+import time
+import tty
+
+# =============================================================================
+# 1. SETTINGS
+# =============================================================================
+SCORE_DIR = os.environ.get("DNAPLAY_DIR", "/var/lib/genomics-game")
+SCORE_FILE = os.path.join(SCORE_DIR, "scores.log")
+PERSONAL_FILE = os.path.expanduser("~/.dnaplay_scores")   # used if the shared file is unavailable
+SEEN_FILE = os.path.expanduser("~/.dnaplay_seen")         # tutorial has been shown once
+
+START_SCORE = 100
+FPS = 20                 # frame cap (keeps CPU low)
+IDLE_EXIT = 120          # seconds without a key press -> game ends
+SP = 3                   # screen columns per base
+MAGNET_RANGE = SP        # snap when within one base spacing of the binding site
+TARGET_ALERT_RANGE = 4 * SP
+PAD = 1                  # left margin (columns)
+TOP = 4                  # screen row where the primer waits
+SHIP_ACCEL = 46.0        # screen units per second squared
+SHIP_MAX_SPEED = 20.0    # screen units per second
+SHIP_DRAG = 1.8          # flight damping per second
+WRONG_PENALTY = 5
+ESCAPE_PENALTY = 15
+MUTATION_BONUS = 10
+SITE_MUTATION_CHANCE = 0.3
+DECOY_MUTATION_RATE = 0.04
+POWERUP_CHANCE = 0.15
+POWERUP_MAX = 3
+HELICASE_SECONDS = 5.0
+
+PAIR = {"A": "T", "T": "A", "G": "C", "C": "G"}
+POINTS = {"A": 2, "T": 2, "G": 3, "C": 3}           # hydrogen bonds per pair
+
+BASE_COLORS = {"A": (80, 230, 110), "T": (255, 90, 90),
+               "G": (90, 170, 255), "C": (255, 215, 80)}
+WHITE, TEXT, DIM = (255, 255, 255), (225, 230, 240), (120, 130, 150)
+ACCENT, GOOD, BAD = (110, 220, 255), (90, 255, 140), (255, 70, 70)
+GOLD, MAGENTA, TEAL = (255, 215, 80), (255, 40, 220), (110, 255, 210)
+NEON = [(255, 20, 200), (190, 40, 255), (40, 120, 255), (0, 255, 255),
+        (60, 255, 40), (255, 245, 0), (255, 110, 0)]
+
+# Standard genetic code (DNA codons), TCAG order
+_B = "TCAG"
+_AA = "FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG"
+CODONS = {a + b + c: _AA[16 * i + 4 * j + k]
+          for i, a in enumerate(_B) for j, b in enumerate(_B) for k, c in enumerate(_B)}
+
+FACTS = [
+    "G-C pairs hold with 3 hydrogen bonds, A-T pairs with 2 - that is why G-C scores more.",
+    "Stretched out, the DNA in one human cell is about 2 metres long.",
+    "The human genome has about 3.1 billion base pairs.",
+    "Primers like yours start every PCR reaction and most sequencing runs.",
+    "In bacteria, helicase unzips DNA at up to about 1,000 base pairs per second.",
+    "With proofreading and repair, DNA copying makes about 1 error per billion bases.",
+    "Three stop codons end a protein: TAA, TAG and TGA.",
+    "ATG codes for methionine and is where almost every protein starts.",
+    "Humans and chimpanzees share about 98.8% of their DNA.",
+    "Rosalind Franklin's Photo 51 revealed the helical shape of DNA in 1952.",
+    "One full turn of the double helix is about 10.5 base pairs.",
+    "The first human genome took 13 years; today one can be sequenced in about a day.",
+]
+
+# 5x7 font for the title ("#" = lit pixel)
+FONT = {
+    "D": "####./#...#/#...#/#...#/#...#/#...#/####.",
+    "N": "#...#/##..#/#.#.#/#..##/#...#/#...#/#...#",
+    "A": ".###./#...#/#...#/#####/#...#/#...#/#...#",
+    "P": "####./#...#/#...#/####./#..../#..../#....",
+    "L": "#..../#..../#..../#..../#..../#..../#####",
+    "Y": "#...#/#...#/.#.#./..#../..#../..#../..#..",
+    " ": "...../...../...../...../...../...../.....",
+}
+
+
+def clamp(x, lo=0.0, hi=1.0):
+    return lo if x < lo else hi if x > hi else x
+
+
+def mix(c1, c2, w):
+    w = clamp(w)
+    return tuple(int(round(a + (b - a) * w)) for a, b in zip(c1, c2))
+
+
+def shade(c, f):
+    return tuple(min(255, max(0, int(v * f))) for v in c)
+
+
+def fmt(n):
+    return "{:,}".format(n)
+
+
+# =============================================================================
+# 2. TERMINAL: colours, Braille canvas, diff renderer, keyboard
+# =============================================================================
+def rgb_to_256(r, g, b):
+    if abs(r - g) < 12 and abs(g - b) < 12:
+        gray = (r + g + b) // 3
+        return 16 if gray < 8 else 231 if gray > 248 else 232 + int(round((gray - 8) / 247 * 23))
+    return 16 + 36 * int(round(r / 255 * 5)) + 6 * int(round(g / 255 * 5)) + int(round(b / 255 * 5))
+
+
+_SEQ = {}
+
+
+def color_seq(rgb, mode):
+    if rgb is None or mode == "none":
+        return ""
+    key = (rgb, mode)
+    if key not in _SEQ:
+        if mode == "true":
+            _SEQ[key] = "\x1b[38;2;%d;%d;%dm" % rgb
+        else:
+            _SEQ[key] = "\x1b[38;5;%dm" % rgb_to_256(*rgb)
+    return _SEQ.get(key)
+
+
+def detect_color_mode():
+    if os.environ.get("NO_COLOR"):
+        return "none"
+    ct = os.environ.get("COLORTERM", "").lower()
+    if "truecolor" in ct or "24bit" in ct or "direct" in os.environ.get("TERM", ""):
+        return "true"
+    return "256"
+
+
+def terminal_size():
+    try:
+        sz = os.get_terminal_size(1)
+        return sz.columns, sz.lines
+    except OSError:
+        sz = shutil.get_terminal_size((80, 24))
+        return sz.columns, sz.lines
+
+
+DOT_BITS = ((0x01, 0x02, 0x04, 0x40), (0x08, 0x10, 0x20, 0x80))
+BLANK = (" ", "")
+
+
+class Canvas:
+    """Grid of cells.  Each cell shows Braille dots or one text character."""
+
+    def __init__(self, cols, rows):
+        self.cols, self.rows, self.w, self.h = cols, rows, cols * 2, rows * 4
+        self.ox = 0                                   # shake offset (columns)
+        self.clear()
+
+    def clear(self):
+        n = self.cols * self.rows
+        self.mask, self.color, self.text = [0] * n, [None] * n, [None] * n
+
+    def dot(self, x, y, color):
+        x, y = int(x) + 2 * self.ox, int(y)
+        if 0 <= x < self.w and 0 <= y < self.h:
+            i = (y >> 2) * self.cols + (x >> 1)
+            if self.text[i] is None:                  # never recolour a letter
+                self.mask[i] |= DOT_BITS[x & 1][y & 3]
+                self.color[i] = color
+
+    def text_at(self, col, row, s, color):
+        col, row = int(col) + self.ox, int(row)
+        if 0 <= row < self.rows:
+            for k, ch in enumerate(s):
+                c = col + k
+                if 0 <= c < self.cols and ch != " ":
+                    i = row * self.cols + c
+                    self.text[i] = ch
+                    self.color[i] = color
+
+    def centre(self, row, s, color):
+        self.text_at((self.cols - len(s)) // 2, row, s, color)
+
+    def segments(self, col, row, segs):
+        """Write [(text, colour), ...] one after another; returns the end column."""
+        for s, c in segs:
+            self.text_at(col, row, s, c)
+            col += len(s)
+        return col
+
+    def glyph(self, x, y, ch, scale, color):
+        rows = FONT.get(ch, FONT.get(" ")).split("/")
+        for ry, line in enumerate(rows):
+            for rx, px in enumerate(line):
+                if px == "#":
+                    for dy in range(scale):
+                        for dx in range(scale):
+                            self.dot(x + rx * scale + dx, y + ry * scale + dy, color)
+
+
+class Renderer:
+    """Only sends the cells that changed since the last frame."""
+
+    def __init__(self, cols, rows, mode):
+        self.cols, self.rows, self.mode = cols, rows, mode
+        self.front = [BLANK] * (cols * rows)
+
+    def render(self, cv):
+        out, last, cur = [], -2, None
+        for i in range(self.cols * self.rows):
+            ch = cv.text[i]
+            if ch is None:
+                ch = chr(0x2800 + cv.mask[i]) if cv.mask[i] else " "
+            state = BLANK if ch == " " else (ch, color_seq(cv.color[i], self.mode))
+            if self.front[i] == state:
+                continue
+            self.front[i] = state
+            r, c = divmod(i, self.cols)
+            if i != last + 1 or c == 0:
+                out.append("\x1b[%d;%dH" % (r + 1, c + 1))
+            last = i
+            ch, seq = state
+            if seq and seq != cur:
+                out.append(seq)
+                cur = seq
+            out.append(ch)
+        return "".join(out).encode("utf-8")
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        try:
+            view = view[os.write(fd, view):]
+        except BlockingIOError:
+            select.select([], [fd], [], 0.1)
+
+
+class TerminalGuard:
+    """Alternate screen + cbreak input; ALWAYS restores the terminal."""
+
+    def __enter__(self):
+        self.saved = termios.tcgetattr(0)
+        tty.setcbreak(0)
+        termios.tcflush(0, termios.TCIFLUSH)
+        write_all(1, b"\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[2J")
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            write_all(1, b"\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l")
+        finally:
+            termios.tcsetattr(0, termios.TCSAFLUSH, self.saved)
+        return False
+
+
+KEYMAP = {" ": "drop", "\r": "enter", "\n": "enter", "a": "left", "d": "right",
+          "w": "up", "s": "down", "h": "left", "j": "down", "k": "up", "l": "right"}
+
+
+def read_keys(timeout):
+    """Wait up to `timeout` seconds; return the keys pressed as names."""
+    ready, _, _ = select.select([0], [], [], max(0.0, timeout))
+    if not ready:
+        return []
+    try:
+        data = os.read(0, 64).decode("latin-1")
+    except OSError:
+        return []
+    keys, i = [], 0
+    while i < len(data):
+        if data.startswith("\x1b[", i) or data.startswith("\x1bO", i):
+            keys.append({"D": "left", "C": "right", "A": "up", "B": "down"}.get(data[i + 2:i + 3], ""))
+            i += 3
+        else:
+            ch = data[i].lower()
+            keys.append(KEYMAP.get(ch, "esc" if ch == "\x1b" else ch))
+            i += 1
+    return [k for k in keys if k]
+
+
+class Screen:
+    """Owns the canvas; rebuilds it when the window is resized."""
+
+    def __init__(self):
+        self.mode, self.resized, self.cv = detect_color_mode(), True, None
+        signal.signal(signal.SIGWINCH, self._winch)
+
+    def _winch(self, signum, frame):
+        self.resized = True
+
+    def canvas(self):
+        if self.resized:
+            self.resized = False
+            cols, rows = terminal_size()
+            self.cv = Canvas(cols, rows - 1)
+            self.rend = Renderer(cols, rows - 1, self.mode)
+            write_all(1, b"\x1b[0m\x1b[2J")
+        self.cv.clear()
+        self.cv.ox = 0
+        return self.cv
+
+    def too_small(self):
+        return self.cv.cols < 80 or self.cv.rows < 23
+
+    def show(self):
+        data = self.rend.render(self.cv)
+        if data:
+            write_all(1, data)
+
+
+# =============================================================================
+# 3. SCOREBOARD  (append-only, locked, no symlinks, sanitised on read)
+# =============================================================================
+def clean_user(name):
+    """Safe display name: drop any @domain, keep A-Z a-z 0-9 . _ - only."""
+    return re.sub(r"[^A-Za-z0-9._-]", "", name.split("@")[0])[:24] or "unknown"
+
+
+def login_name():
+    try:
+        return clean_user(pwd.getpwuid(os.getuid()).pw_name)
+    except KeyError:
+        return "uid%d" % os.getuid()
+
+
+def ensure_score_dir(directory):
+    """Create a score directory if needed without failing the game."""
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        pass
+
+
+def _open_regular(path, flags, perm=0o664):
+    """Open only a real file (never a symlink, FIFO or device)."""
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, perm)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError("not a regular file: " + path)
+    return fd
+
+
+def save_score(user, mode, score, combo, proteins):
+    """Append one line.  Returns the file used, or None."""
+    line = "%d\t%s\t%s\t%d\t%d\t%d\n" % (int(time.time()), user, mode, score, combo, proteins)
+    ensure_score_dir(os.path.dirname(SCORE_FILE) or ".")
+    for path, perm in ((SCORE_FILE, 0o664), (PERSONAL_FILE, 0o600)):
+        try:
+            fd = _open_regular(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, perm)
+        except OSError:
+            continue
+        try:
+            if os.fstat(fd).st_uid == os.getuid():
+                os.fchmod(fd, perm)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            write_all(fd, line.encode("ascii"))
+            return path
+        except OSError:
+            continue
+        finally:
+            os.close(fd)
+    return None
+
+
+def load_scores():
+    """Returns (entries, source).  Bad or hostile lines are ignored."""
+    for path, label in ((SCORE_FILE, "shared"), (PERSONAL_FILE, "personal")):
+        try:
+            fd = _open_regular(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            chunks = []
+            while sum(len(c) for c in chunks) < 4000000:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except OSError:
+            continue
+        finally:
+            os.close(fd)
+        entries = []
+        for raw in b"".join(chunks).decode("ascii", "replace").splitlines():
+            parts = raw.split("\t")
+            if len(parts) != 6 or not re.fullmatch(r"[a-z0-9:-]{1,20}", parts[2]):
+                continue
+            try:
+                ts, score, combo, prot = (int(parts[n]) for n in (0, 3, 4, 5))
+            except ValueError:
+                continue
+            if 0 <= score < 10 ** 8:
+                entries.append((score, clean_user(parts[1]), parts[2], ts, combo, prot))
+        return entries, label
+    return [], "none"
+
+
+def board(entries, mode, limit):
+    """Best score per user for one mode, highest first."""
+    best = {}
+    for e in entries:
+        prev = best.get(e[1])
+        if e[2] == mode and (prev is None or e[0] > prev[0]):
+            best[e[1]] = e
+    return sorted(best.values(), key=lambda e: -e[0])[:limit]
+
+
+def personal_best(entries, user, mode):
+    return max([e[0] for e in entries if e[1] == user and e[2] == mode] + [0])
+
+
+def daily_tag():
+    return "daily-" + datetime.date.today().isoformat()
+
+
+# =============================================================================
+# 4. THE GAME
+# =============================================================================
+class Game:
+    def __init__(self, mode, seed, best, demo=False):
+        self.mode, self.best_before = mode, best
+        self.demo = demo
+        self.rng = random.Random(seed)
+        star_rng = random.Random(7)
+        self.stars = [(star_rng.random(), star_rng.random(), star_rng.choice((0.12, 0.25, 0.45)),
+                       star_rng.choice(NEON)) for _ in range(70)]
+        self.strand, self.mut, self.bound = [], set(), {}
+        self.upper_strand, self.upper_mut, self.upper_bound = [], set(), {}
+        self.upper_offset = 0.0
+        self.score = self.peak = START_SCORE
+        self.heat = float(START_SCORE)
+        self.streak = self.best_streak = self.binds = 0
+        self.offset = self.t = 0.0
+        self.power = {"1": 0, "2": 0}                 # 1 = Helicase, 2 = Polymerase
+        self.helicase_until, self.autoguide = 0.0, False
+        self.protein, self.codon_buf, self.proteins = "", "", 0
+        self.particles, self.floaters, self.flash_good = [], [], {}
+        self.msg = ("Pilot your polymer into the matching strand to bind!", ACCENT, 4.0)
+        self.shake_until = self.flash_bad_until = 0.0
+        self.px, self.py = 12.0, float(TOP + 7)
+        self.vx = self.vy = 0.0
+        self.facing = (1.0, 0.0)
+        self.crashing, self.crash_until = False, 0.0
+        self.target, self.target_seq, self.primer = -1, "", ""
+        self.target_lane = "lower"
+        self.next_target_seq = ""
+        self.cols, self.rows = 80, 23
+        self.over, self.reason = False, ""
+
+    # ---- geometry --------------------------------------------------------------
+    def x_of(self, i):
+        return PAD + i * SP - self.offset
+
+    def upper_x_of(self, i):
+        return self.cols - PAD - i * SP + self.upper_offset
+
+    def target_x(self):
+        return self.x_of(self.target) if self.target_lane == "lower" else self.upper_x_of(self.target)
+
+    def target_near(self):
+        if self.target < 0 or self.crashing:
+            return False
+        target_y = TOP + 3 if self.target_lane == "upper" else self.rows - 4
+        return math.hypot(self.px - self.target_x(), self.py - target_y) <= TARGET_ALERT_RANGE
+
+    def index_at(self, x):
+        return int((x - PAD + self.offset) // SP)
+
+    def land_row(self):
+        return self.rows - 6
+
+    def speed(self):
+        s = min(16.0, 3.0 + self.heat * 0.011)       # columns per second
+        return s * (0.4 if self.t < self.helicase_until else 1.0)
+
+    def target_length(self):
+        return 3 if self.heat < 250 else (4 if self.heat < 600 else 5)
+
+    # ---- the strand --------------------------------------------------------------
+    def ensure(self, n):
+        """Grow the strand to n bases without creating a second copy of the target."""
+        forbidden = [seq for seq in (self.target_seq, self.next_target_seq) if seq]
+        while len(self.strand) < n:
+            for _ in range(8):
+                b = self.rng.choice("ACGT")
+                if all(
+                    "".join(self.strand[-len(seq) + 1:]) + b != seq
+                    for seq in forbidden
+                ):
+                    break
+            self.strand.append(b)
+            if self.rng.random() < DECOY_MUTATION_RATE:
+                self.mut.add(len(self.strand) - 1)
+
+    def ensure_upper(self, n):
+        self.ensure(n)
+        while len(self.upper_strand) < len(self.strand):
+            i = len(self.upper_strand)
+            self.upper_strand.append(PAIR[self.strand[i]])
+            if i in self.mut:
+                self.upper_mut.add(i)
+
+    def new_primer(self):
+        """Place the queued target on either opposing strand."""
+        L = len(self.next_target_seq) or self.target_length()
+        seq = self.next_target_seq if len(self.next_target_seq) == L else ""
+        if not seq:
+            seq = "".join(self.rng.choice("ACGT") for _ in range(L))
+        self.target_lane = self.rng.choice(("lower", "upper"))
+        if self.target_lane == "lower":
+            right = self.index_at(self.cols) + 1
+            self.target_seq = ""
+            self.ensure(right + 64)
+            self.ensure_upper(right + 64)
+            j = right + self.rng.randint(0, 3)
+            del self.strand[j:]
+            del self.upper_strand[j:]
+            self.mut = {k for k in self.mut if k < j}
+            self.upper_mut = {k for k in self.upper_mut if k < j}
+            self.upper_bound = {k: v for k, v in self.upper_bound.items() if k < j}
+            self.strand.extend(seq)
+            self.upper_strand.extend(PAIR[base] for base in seq)
+            if self.rng.random() < SITE_MUTATION_CHANCE:
+                mutated = j + self.rng.randrange(L)
+                self.mut.add(mutated)
+                self.upper_mut.add(mutated)
+            self.target, self.target_seq = j, seq
+            self.ensure(right + 60)
+            self.ensure_upper(right + 60)
+        else:
+            j = max(L - 1, int((self.cols - PAD + self.upper_offset) // SP))
+            self.ensure_upper(j + 2)
+            for n, base in enumerate(seq):
+                self.upper_strand[j - n] = base
+                self.strand[j - n] = PAIR[base]
+                self.mut.discard(j - n)
+            if self.rng.random() < SITE_MUTATION_CHANCE:
+                mutated = j - self.rng.randrange(L)
+                self.upper_mut.add(mutated)
+                self.mut.add(mutated)
+            self.target, self.target_seq = j, seq
+        self.primer = "".join(PAIR.get(b) for b in seq)
+        self.next_target_seq = ""
+        preview_length = self.target_length()
+        lower_first = max(0, self.index_at(0))
+        lower_last = min(len(self.strand) - preview_length, self.index_at(self.cols))
+        occupied = {
+            "".join(self.strand[k:k + preview_length])
+            for k in range(lower_first, lower_last + 1)
+        }
+        upper_first = max(preview_length - 1, int((self.upper_offset - PAD) // SP))
+        upper_last = min(
+            len(self.upper_strand) - 1,
+            int((self.cols - PAD + self.upper_offset) // SP),
+        )
+        occupied.update(
+            "".join(self.upper_strand[k - n] for n in range(preview_length))
+            for k in range(upper_first, upper_last + 1)
+        )
+        candidates = [
+            "".join(bases)
+            for bases in itertools.product("ACGT", repeat=preview_length)
+            if "".join(bases) not in occupied
+        ]
+        if not candidates:
+            candidates = [
+                "".join(bases)
+                for bases in itertools.product("ACGT", repeat=preview_length)
+                if "".join(bases) not in occupied
+            ]
+        self.next_target_seq = self.rng.choice(candidates) if candidates else self.target_seq
+    # ---- player input ------------------------------------------------------------------
+    def key(self, k):
+        if k == "1" and self.power.get("1") > 0:
+            self.power["1"] -= 1
+            self.helicase_until = self.t + HELICASE_SECONDS
+            self.say("HELICASE! Strand slowed for 5 seconds", TEAL)
+        elif k == "2" and self.power.get("2") > 0 and not self.autoguide:
+            self.power["2"] -= 1
+            self.autoguide = True
+            self.say("POLYMERASE! Guiding your primer in...", GOLD)
+        if self.autoguide or self.crashing:
+            return
+        directions = {
+            "left": (-1.0, 0.0), "right": (1.0, 0.0),
+            "up": (0.0, -1.0), "down": (0.0, 1.0),
+        }
+        if k in directions:
+            dx, dy = directions[k]
+            self.facing = (dx, dy)
+            self.vx += dx * SHIP_ACCEL * 0.12
+            self.vy += dy * SHIP_ACCEL * 0.12
+            self._limit_ship_speed()
+        elif k == "drop":
+            self.vx += self.facing[0] * SHIP_ACCEL * 0.3
+            self.vy += self.facing[1] * SHIP_ACCEL * 0.3
+            self._limit_ship_speed()
+
+    def _limit_ship_speed(self):
+        speed = math.hypot(self.vx, self.vy)
+        if speed > SHIP_MAX_SPEED:
+            scale = SHIP_MAX_SPEED / speed
+            self.vx *= scale
+            self.vy *= scale
+
+    def _demo_pilot(self, dt, rows):
+        lane_y = TOP if self.target_lane == "upper" else rows - 3
+        center_y = (TOP + rows - 3) / 2.0
+        target_velocity = self.speed() * (1.0 if self.target_lane == "upper" else -1.0)
+        time_to_lane = abs(lane_y - self.py) / 10.0
+        lead_x = self.target_x() + target_velocity * time_to_lane
+        x_error = lead_x - self.px
+        target_y = lane_y if abs(x_error) <= 1.5 else center_y
+        y_error = target_y - self.py
+        desired_vx = target_velocity + max(-12.0, min(12.0, x_error * 1.8))
+        desired_vy = max(-12.0, min(12.0, y_error * 2.0))
+        ax = max(-SHIP_ACCEL, min(SHIP_ACCEL, (desired_vx - self.vx) / max(dt, 0.001)))
+        ay = max(-SHIP_ACCEL, min(SHIP_ACCEL, (desired_vy - self.vy) / max(dt, 0.001)))
+        self.vx += ax * dt
+        self.vy += ay * dt
+        self._limit_ship_speed()
+        if abs(x_error) > 0.2:
+            self.facing = (1.0 if x_error > 0 else -1.0, 0.0)
+        elif abs(y_error) > 0.2:
+            self.facing = (0.0, 1.0 if y_error > 0 else -1.0)
+
+    def say(self, text, color, secs=2.0):
+        self.msg = (text, color, self.t + secs)
+
+    def add(self, pts):
+        self.score += pts
+        self.peak = max(self.peak, self.score)
+
+    # ---- one frame of game time ------------------------------------------------------
+    def update(self, dt, cols, rows):
+        self.t += dt
+        self.cols, self.rows = cols, rows
+        self.heat += (self.score - self.heat) * min(1.0, dt * 0.5)   # lagging difficulty
+        move = self.speed() * dt
+        self.offset += move
+        self.upper_offset += move
+        self.ensure(self.index_at(cols) + 60)
+        self.ensure_upper(int((cols - PAD + self.upper_offset) // SP) + 60)
+        if self.target < 0:
+            self.new_primer()
+        if self.crashing:
+            self.px += self.vx * dt
+            self.py += self.vy * dt
+            if self.t >= self.crash_until:
+                self.crashing = False
+                self.autoguide = False
+                self.px, self.py = cols / 2.0, (TOP + self.land_row()) / 2.0
+                self.vx = self.vy = 0.0
+                self.new_primer()
+        else:
+            old_y = self.py
+            if self.autoguide:
+                target_y = TOP + 3 if self.target_lane == "upper" else rows - 4
+                horizontal_error = self.target_x() - self.px
+                self.px += max(-18.0 * dt, min(18.0 * dt, horizontal_error))
+                if abs(horizontal_error) <= 1.5:
+                    self.py += max(-12.0 * dt, min(12.0 * dt, target_y - self.py))
+                self.vx = self.vy = 0.0
+            else:
+                if self.demo:
+                    self._demo_pilot(dt, rows)
+                self.px += self.vx * dt
+                self.py += self.vy * dt
+                drag = math.exp(-SHIP_DRAG * dt)
+                self.vx *= drag
+                self.vy *= drag
+            max_x = max(0.0, cols - len(self.primer) * SP - 1)
+            self.px = max(0.0, min(max_x, self.px))
+            self.py = max(float(TOP), min(float(rows - 3), self.py))
+            if self.demo:
+                if self.px <= 0 and self.vx < 0:
+                    self.vx = 0.0
+                elif self.px >= max_x and self.vx > 0:
+                    self.vx = 0.0
+            upper_y, lower_y = TOP + 3, rows - 4
+            for lane, y in (("upper", upper_y), ("lower", lower_y)):
+                crossed = (old_y < y <= self.py) or (old_y > y >= self.py)
+                if crossed:
+                    self.resolve(lane)
+                    break
+            if not self.crashing:
+                target_x = self.target_x()
+                if ((self.target_lane == "lower" and target_x < 0)
+                        or (self.target_lane == "upper" and target_x >= cols)):
+                    self.escape()
+                elif (not self.demo and
+                      ((self.px <= 0 and self.vx < -1) or (self.px >= max_x and self.vx > 1))):
+                    self.miss()
+        self.particles = [p for p in self.particles if p.get("t") > self.t]
+        for p in self.particles:
+            p["x"] += p.get("vx") * dt
+            p["y"] += p.get("vy") * dt
+        self.floaters = [f for f in self.floaters if f.get("t") > self.t]
+        for f in self.floaters:
+            f["y"] -= 3.0 * dt
+        old = [i for i in self.bound if i < self.index_at(0) - 10]
+        for i in old:
+            self.bound.pop(i, None)
+            self.flash_good.pop(i, None)
+        if self.score <= 0 and not self.over:
+            self.over, self.reason = True, "Your score reached zero."
+
+    def resolve(self, lane):
+        L = len(self.primer)
+        if lane != self.target_lane:
+            self.miss(lane)
+            return
+        if lane == "lower":
+            if abs(self.px - self.target_x()) <= MAGNET_RANGE:
+                self.px = self.target_x()
+            idx = int(round((self.px - PAD + self.offset) / SP))
+            seg = "".join(self.strand[idx:idx + L]) if idx >= 0 else ""
+        else:
+            if abs(self.px - self.target_x()) <= MAGNET_RANGE:
+                self.px = self.target_x()
+            idx = int(round((self.cols - PAD + self.upper_offset - self.px) / SP))
+            seg = "".join(self.upper_strand[idx - k] for k in range(L)) if idx >= L - 1 else ""
+        if seg == self.target_seq:
+            self.bind(idx)
+        else:
+            self.miss()
+
+    def bind(self, idx):
+        L = len(self.primer)
+        self.streak += 1
+        self.binds += 1
+        self.best_streak = max(self.best_streak, self.streak)
+        mult = min(5, 1 + self.streak // 3)
+        strand_mut = self.mut if self.target_lane == "lower" else self.upper_mut
+        muts = sum(1 for k in (range(idx, idx + L) if self.target_lane == "lower"
+                               else range(idx - L + 1, idx + 1)) if k in strand_mut)
+        pts = sum(POINTS.get(b, 2) for b in self.target_seq) * mult + muts * MUTATION_BONUS
+        self.add(pts)
+        if self.target_lane == "lower":
+            for k in range(L):
+                self.bound[idx + k] = self.primer[k]
+                self.flash_good[idx + k] = self.t + 0.6
+                self.mut.discard(idx + k)
+            x = self.x_of(idx) + L * SP / 2.0
+        else:
+            for k in range(L):
+                strand_idx = idx - k
+                self.upper_bound[strand_idx] = self.primer[k]
+                self.upper_mut.discard(strand_idx)
+            x = self.upper_x_of(idx) + L * SP / 2.0
+        y = (self.land_row() if self.target_lane == "lower" else TOP + 5) * 4 + 2
+        for n in range(26):
+            ang = 2 * math.pi * n / 26
+            spd = self.rng.uniform(15, 45)
+            self.particles.append({"x": x * 2, "y": y, "vx": spd * math.cos(ang) * 2,
+                                   "vy": spd * math.sin(ang), "t": self.t + self.rng.uniform(0.3, 0.7),
+                                   "c": self.rng.choice((GOOD, TEAL, WHITE, GOLD))})
+        self.floaters.append({"x": x - 2, "y": float(self.land_row() - 1), "s": "+%d" % pts,
+                              "c": GOOD, "t": self.t + 1.0})
+        text = "BOUND! +%d" % pts
+        if mult > 1:
+            text += "   x%d COMBO" % mult
+        if muts:
+            text += "   mutation repaired!"
+        self.say(text, GOOD)
+        self.codons(self.primer)
+        if self.streak % 5 == 0 or self.rng.random() < POWERUP_CHANCE:
+            kind = self.rng.choice(("1", "2"))
+            if self.power.get(kind) < POWERUP_MAX:
+                self.power[kind] += 1
+                name = "Helicase" if kind == "1" else "Polymerase"
+                self.say("%s   +1 %s (press %s)" % (text, name, kind), GOLD, 2.5)
+        self.autoguide = False
+        self.new_primer()
+        if self.demo:
+            self.py = (TOP + self.rows - 3) / 2.0
+            self.vx = self.vy = 0.0
+
+    def miss(self, lane=None):
+        self.add(-WRONG_PENALTY)
+        self.streak = 0
+        self.shake_until = self.t + 0.3
+        self.flash_bad_until = self.t + 0.4
+        self.say("Wrong bind! Polymer flew off   -%d" % WRONG_PENALTY, BAD)
+        lane = lane or self.target_lane
+        self.vx = -SHIP_MAX_SPEED if self.px > self.cols / 2 else SHIP_MAX_SPEED
+        self.vy = -SHIP_MAX_SPEED if lane == "upper" else SHIP_MAX_SPEED
+        self.crashing = True
+        self.crash_until = self.t + 0.65
+
+    def escape(self):
+        L = len(self.primer)
+        strand_mut = self.mut if self.target_lane == "lower" else self.upper_mut
+        indexes = (range(self.target, self.target + L) if self.target_lane == "lower"
+                   else range(self.target - L + 1, self.target + 1))
+        doubled = any(k in strand_mut for k in indexes)
+        pen = ESCAPE_PENALTY * (2 if doubled else 1)
+        self.add(-pen)
+        self.streak = 0
+        y = (self.rows - 4) * 4 + 2
+        for n in range(18):
+            self.particles.append({"x": self.rng.uniform(0, 8), "y": y + self.rng.uniform(-6, 6),
+                                   "vx": -self.rng.uniform(5, 25), "vy": self.rng.uniform(-8, 8),
+                                   "t": self.t + self.rng.uniform(0.4, 0.9), "c": BAD})
+        self.floaters.append({"x": 2, "y": float(self.rows - 7), "s": "-%d" % pen, "c": BAD,
+                              "t": self.t + 1.0})
+        self.say("Site escaped!   -%d%s" % (pen, "  (mutation lost: double)" if doubled else ""), BAD)
+        self.new_primer()
+
+    def codons(self, bases):
+        self.codon_buf += bases
+        while len(self.codon_buf) >= 3:
+            codon, self.codon_buf = self.codon_buf[:3], self.codon_buf[3:]
+            aa = CODONS.get(codon, "?")
+            if aa == "*" or len(self.protein) >= 40:
+                if self.protein:
+                    bonus = 5 * len(self.protein)
+                    self.add(bonus)
+                    self.proteins += 1
+                    self.say("Protein released! %d amino acids   +%d" % (len(self.protein), bonus), MAGENTA, 2.5)
+                self.protein = ""
+            else:
+                self.protein += aa
+
+    # ---- drawing --------------------------------------------------------------------
+    def draw(self, cv, paused=False):
+        cols, rows = cv.cols, cv.rows
+        strand_row, land = rows - 4, self.land_row()
+        upper_row = TOP + 3
+        target_near = self.target_near()
+        target_blink = GOLD if int(self.t * 6) % 2 == 0 else WHITE
+        if self.t < self.shake_until:
+            cv.ox = 1 if int(self.t * 30) % 2 else -1
+        # background stars (parallax with the strand)
+        for sx, sy, depth, col in self.stars:
+            x = (sx * cv.w - self.offset * 2 * depth) % cv.w
+            y = 4 * 3 + sy * (land * 4 - 12)
+            tw = 0.5 + 0.5 * math.sin(self.t * 2.0 + sx * 40)
+            cv.dot(x, y, shade(mix((150, 160, 190), col, tw * 0.6), 0.45 + 0.35 * tw))
+        # backbone wave under the strand
+        for x in range(cv.w):
+            y = (strand_row + 1) * 4 + 1 + int(round(1.4 * math.sin((x + self.offset * 2) * 0.21)))
+            cv.dot(x, y, (60, 110, 200) if x % 6 < 3 else (170, 60, 70))
+        # strand letters, rungs and built (bound) strand
+        for i in range(max(0, self.index_at(0)), min(len(self.strand), self.index_at(cols) + 2)):
+            x = int(round(self.x_of(i)))
+            b = self.strand[i]
+            col = BASE_COLORS.get(b)
+            if target_near and self.target_lane == "lower" and self.target <= i < self.target + len(self.target_seq):
+                col = target_blink
+            elif i in self.mut:
+                col = mix(MAGENTA, WHITE, 0.5 + 0.5 * math.sin(self.t * 9))
+            if self.flash_good.get(i, 0) > self.t:
+                col = GOOD
+            cv.text_at(x, strand_row, b, col)
+            if i in self.bound:
+                pb = self.bound.get(i)
+                for dy in range(4):
+                    cv.dot((x + cv.ox * 0) * 2, (strand_row - 1) * 4 + dy,
+                           mix(BASE_COLORS.get(b), BASE_COLORS.get(pb), dy / 3.0))
+                glow = self.flash_good.get(i, 0) > self.t
+                cv.text_at(x, land, pb, WHITE if glow else mix(BASE_COLORS.get(pb), TEAL, 0.35))
+        upper_first = max(0, int((self.upper_offset - PAD) // SP) - 1)
+        upper_last = min(
+            len(self.upper_strand),
+            int((cols - PAD + self.upper_offset) // SP) + 2,
+        )
+        for i in range(upper_first, upper_last):
+            x = int(round(self.upper_x_of(i)))
+            base = self.upper_strand[i]
+            if target_near and self.target_lane == "upper" and self.target - len(self.target_seq) + 1 <= i <= self.target:
+                color = target_blink
+            else:
+                color = mix(MAGENTA, WHITE, 0.5 + 0.5 * math.sin(self.t * 9)) if i in self.upper_mut else BASE_COLORS[base]
+            cv.text_at(x, upper_row, base, color)
+            if i in self.upper_bound:
+                cv.text_at(x, upper_row + 2, self.upper_bound[i], TEAL)
+        # sparks and score pop-ups
+        for p in self.particles:
+            cv.dot(p.get("x"), p.get("y"), p.get("c"))
+        for f in self.floaters:
+            cv.text_at(f.get("x"), f.get("y"), f.get("s"), f.get("c"))
+        # The polymer primer is piloted like a small ship.
+        L = len(self.primer)
+        bad = self.t < self.flash_bad_until
+        y = int(self.py)
+        for x in range(int(self.px * 2), int((self.px + L * SP - 1) * 2)):
+            cv.dot(x, y * 4 - 1, GOLD if self.autoguide else TEAL)
+        for k, b in enumerate(self.primer):
+            c = BAD if bad else (mix(BASE_COLORS.get(b), GOLD, 0.5) if self.autoguide else BASE_COLORS.get(b))
+            cv.text_at(int(round(self.px)) + k * SP, y, b, c)
+        if self.facing == (1.0, 0.0):
+            ship = ">"
+        elif self.facing == (-1.0, 0.0):
+            ship = "<"
+        elif self.facing == (0.0, -1.0):
+            ship = "^"
+        else:
+            ship = "v"
+        cv.text_at(int(round(self.px)) - 2, y, ship, BAD if self.crashing else GOLD)
+        if target_near:
+            target_row = upper_row if self.target_lane == "upper" else strand_row
+            for k, base in enumerate(self.target_seq):
+                target_x = (self.upper_x_of(self.target - k) if self.target_lane == "upper"
+                            else self.x_of(self.target + k))
+                cv.text_at(int(round(target_x)), target_row, base, target_blink)
+        self.draw_hud(cv)
+        if paused:
+            cv.centre(rows // 2 - 1, "  P A U S E D  ", GOLD)
+            cv.centre(rows // 2 + 1, "press P to continue, Q to quit", DIM)
+
+    def draw_hud(self, cv):
+        cols, rows = cv.cols, cv.rows
+        mult = min(5, 1 + self.streak // 3)
+        bar = int(round((self.speed() - 3.0) / 13.0 * 8))
+        segs = [("SCORE ", DIM), (fmt(self.score), WHITE if self.score > 30 else BAD),
+                ("   PEAK ", DIM), (fmt(self.peak), GOLD),
+                ("   BEST ", DIM), (fmt(max(self.best_before, self.peak)), TEXT),
+                ("   COMBO ", DIM), ("x%d" % mult, GOOD if mult > 1 else TEXT), (" (%d)" % self.streak, DIM),
+                ("   SPEED ", DIM), ("\u25ae" * max(1, bar), mix(GOOD, BAD, bar / 8.0)),
+                ("\u25af" * (8 - max(1, bar)), (60, 70, 85))]
+        cv.segments(1, 0, segs)
+        if self.mode != "classic":
+            cv.text_at(cols - 16, 0, "DAILY CHALLENGE", MAGENTA)
+        end = cv.segments(1, 1, [("PROTEIN ", DIM)])
+        prot = self.protein[-(cols - 40):]
+        end = cv.segments(end, 1, [(prot, TEAL), (self.codon_buf, DIM), ("_", DIM)])
+        codon_text = codon_preview(self.codon_buf)
+        cv.segments(cols - 32, 1, [("CODON ", DIM), (codon_text, TEAL)])
+        cv.segments(cols - 22, 1, [("Proteins built: ", DIM), (str(self.proteins), MAGENTA)])
+        text, color, until = self.msg
+        if self.t < until:
+            cv.centre(2, text, color)
+        next_primer = "".join(PAIR[b] for b in self.next_target_seq)
+        next_segments = [("NEXT: ", DIM)] + [(b, BASE_COLORS[b]) for b in next_primer]
+        cv.segments(1, 3, next_segments)
+        lane_label = "MATCH UP: " if self.target_lane == "upper" else "MATCH DOWN: "
+        match_segments = [(lane_label, DIM)] + [(b, BASE_COLORS[b]) for b in self.target_seq]
+        match_width = sum(len(text) for text, _ in match_segments)
+        cv.segments(cols - match_width - 1, 3, match_segments)
+        if self.t < self.helicase_until:
+            cv.text_at(cols // 2 - 7, 3, "HELICASE %.1fs" % (self.helicase_until - self.t), TEAL)
+        hint = [("ARROWS/WASD", WHITE), (" steer  ", DIM), ("SPACE", WHITE), (" boost  ", DIM),
+                ("1", WHITE), (" Hel:%d  " % self.power.get("1"), TEAL if self.power.get("1") else DIM),
+                ("2", WHITE), (" Auto:%d  " % self.power.get("2"), GOLD if self.power.get("2") else DIM),
+                ("P", WHITE), (" pause  ", DIM), ("Q", WHITE), (" quit", DIM)]
+        cv.segments(1, rows - 1, hint)
+
+
+# =============================================================================
+# 5. SCREENS: title, tutorial, game, game over
+# =============================================================================
+def run_screen(scr, paint, accept):
+    """Animate `paint` until a key in `accept` is pressed ("*" = any key)."""
+    t0 = last = time.monotonic()
+    while True:
+        cv = scr.canvas()
+        if scr.too_small():
+            cv.centre(cv.rows // 2, "Please make the window at least 80x24", GOLD)
+        else:
+            paint(cv, time.monotonic() - t0)
+        scr.show()
+        for k in read_keys(1.0 / 15):
+            last = time.monotonic()
+            if k in accept or "*" in accept:
+                return accept.get(k, accept.get("*"))
+        if time.monotonic() - last > IDLE_EXIT:
+            return "quit"
+
+
+def paint_stars(cv, t, n=60):
+    rng = random.Random(3)
+    for _ in range(n):
+        x, y, ph = rng.random() * cv.w, rng.random() * cv.h, rng.random() * 6.3
+        tw = 0.5 + 0.5 * math.sin(t * 1.7 + ph)
+        cv.dot(x, y, shade(NEON[int(ph) % len(NEON)], 0.25 + 0.6 * tw))
+
+
+def paint_title(cv, t, word="DNA PLAY"):
+    scale = 2 if cv.rows >= 30 else 1
+    width = len(word) * 6 * scale
+    x0 = (cv.w - width) // 2
+    for n, ch in enumerate(word):
+        c = NEON[int(n + t * 2) % len(NEON)]
+        cv.glyph(x0 + n * 6 * scale, 4, ch, scale, mix(c, WHITE, 0.25))
+    return 1 + (4 + 7 * scale) // 4 + 1
+
+
+def paint_board(cv, col, row, title, rows_, me, count):
+    cv.text_at(col, row, title, ACCENT)
+    cv.text_at(col, row + 1, "-" * 34, (60, 70, 85))
+    if not rows_:
+        cv.text_at(col, row + 2, "no scores yet - be the first!", DIM)
+    for n, e in enumerate(rows_):
+        line = "%2d. %-18s %9s" % (n + 1, e[1][:18], fmt(e[0]))
+        color = GOLD if n == 0 else (TEAL if e[1] == me else TEXT)
+        cv.text_at(col, row + 2 + n, line + ("  <- you" if e[1] == me else ""), color)
+
+
+def paint_boards(cv, row, entries, me):
+    left = max(2, cv.cols // 2 - 38)
+    paint_board(cv, left, row, "TOP SCIENTISTS (classic)", board(entries, "classic", 10), me, 10)
+    paint_board(cv, cv.cols // 2 + 2, row, "TODAY'S DAILY CHALLENGE", board(entries, daily_tag(), 5), me, 5)
+
+
+def title_screen(scr, entries, source, me):
+    def paint(cv, t):
+        paint_stars(cv, t)
+        row = paint_title(cv, t)
+        cv.centre(row, "B A S E   P A I R   B I N D E R", TEAL)
+        cv.centre(row + 1, "pair the primer, bind the strand, build a protein", DIM)
+        paint_boards(cv, row + 3, entries, me)
+        if source != "shared":
+            cv.centre(cv.rows - 3, "(shared scoreboard unavailable - showing your personal scores)", BAD)
+        cv.centre(cv.rows - 2, "[ENTER] play    [D] daily challenge    [T] tutorial    [L] polymer lab    [Q] quit", WHITE)
+    return run_screen(scr, paint, {"enter": "play", "drop": "play", "d": "daily", "t": "tutorial",
+                                   "l": "learn", "q": "quit", "esc": "quit"})
+
+
+def bases_line(seq, color=None):
+    out = []
+    for b in seq:
+        out.append((b, color or BASE_COLORS.get(b, TEXT)))
+        out.append(("  ", TEXT))
+    return out
+
+
+CODON_NAMES = {
+    "A": "Alanine", "R": "Arginine", "N": "Asparagine", "D": "Aspartic acid",
+    "C": "Cysteine", "E": "Glutamic acid", "Q": "Glutamine", "G": "Glycine",
+    "H": "Histidine", "I": "Isoleucine", "L": "Leucine", "K": "Lysine",
+    "M": "Methionine", "F": "Phenylalanine", "P": "Proline", "S": "Serine",
+    "T": "Threonine", "W": "Tryptophan", "Y": "Tyrosine", "V": "Valine",
+    "*": "Stop"
+}
+
+
+def codon_label(codon):
+    aa = CODONS.get(codon, "?")
+    if aa == "*":
+        return "STOP"
+    if aa == "?":
+        return "?"
+    return "%s (%s)" % (aa, CODON_NAMES.get(aa, aa))
+
+
+def codon_preview(seq):
+    if not seq:
+        return "no codon yet"
+    if len(seq) < 3:
+        return "%s (%d/3 bases)" % (seq, len(seq))
+    codon = seq[:3]
+    return "%s -> %s" % (codon, codon_label(codon))
+
+
+POLYMER_GUIDE = [
+    ("POLYMER LAB", [
+        [("DNA is read in triplets called codons. Each codon tells the cell which", TEXT)],
+        [("amino acid to add to the growing chain.", TEXT)],
+        [],
+        [("Example: ", TEXT), ("ATG", TEAL), (" = methionine (start)   ", TEXT), ("TAC", TEAL), (" = tyrosine", TEXT)],
+        [("A stop codon ends the protein: ", TEXT), ("TAA", MAGENTA), (", ", TEXT), ("TAG", MAGENTA), (", ", TEXT), ("TGA", MAGENTA)],
+        [],
+        [("Bind 3 bases at a time to build a protein: every codon is a step in the polymer.", TEXT)],
+        [("Your panel shows the next codon as you play, making it easier to learn the translation map.", TEXT)],
+        [],
+        [("Tip: look for codon blocks that start with ATG and end with a stop signal.", TEXT)],
+    ]),
+]
+
+
+TUTORIAL = [
+    ("THE GOAL", [
+        [("Two complementary DNA strands scroll in opposite directions.", TEXT)],
+        [("You hold a short ", TEXT), ("PRIMER", TEAL), (" with 3 to 5 bases.", TEXT)],
+        [("Steer the polymer ship into a strand so it strikes your target pattern.", TEXT)],
+        [("Use the ", TEXT), ("ARROW KEYS or WASD", WHITE), (" to fly and ", TEXT), ("SPACE", WHITE),
+         (" to thrust. A correct impact binds; a wrong one flies off and costs points.", TEXT)],
+        [],
+        [("   primer:      ", DIM)] + bases_line("TAC"),
+        [("                ", DIM), ("|  |  |", DIM)],
+        [("   strand:", DIM)] + bases_line("GCATGCCA"),
+        [],
+        [("The strand gets faster as your score climbs - and slows again if you slip.", DIM)],
+    ]),
+    ("BASE PAIRING", [
+        [("A", BASE_COLORS.get("A")), (" always pairs with ", TEXT), ("T", BASE_COLORS.get("T")),
+         ("        ", TEXT), ("G", BASE_COLORS.get("G")), (" always pairs with ", TEXT),
+         ("C", BASE_COLORS.get("C"))],
+        [],
+        [("So flip each letter of your primer to find its partner on the strand:", TEXT)],
+        [],
+        [("   primer   ", DIM)] + bases_line("TAC"),
+        [("   needs    ", DIM)] + bases_line("ATG") + [("   <- look for this on the strand", GOLD)],
+        [],
+        [("The upper strand moves right; the lower strand moves left.", TEXT)],
+        [("Line up with the displayed MATCH pattern before you collide.", TEXT)],
+    ]),
+    ("SCORING", [
+        [("You start with ", TEXT), ("100", WHITE), (" points.  Reach 0 and the game is over.", TEXT)],
+        [("Each ", TEXT), ("G-C", GOLD), (" pair scores 3, each ", TEXT), ("A-T", GOOD),
+         (" pair scores 2 (their real hydrogen bonds).", TEXT)],
+        [("Bind in a row for a ", TEXT), ("COMBO", GOOD), (" multiplier: x2, x3 ... up to x5.", TEXT)],
+        [("Wrong impact: ", TEXT), ("-5", BAD), ("     Escaped site: ", TEXT), ("-15", BAD)],
+        [("A glowing ", TEXT), ("magenta", MAGENTA), (" base is a mutation: bind across it for ", TEXT),
+         ("+10", GOOD), (",", TEXT)],
+        [("but if a site with a mutation escapes, the penalty doubles.", TEXT)],
+        [],
+        [("Your PEAK score goes on the shared board with your user ID.", ACCENT)],
+    ]),
+    ("POWER-UPS, PROTEINS AND THE DAILY CHALLENGE", [
+        [("Power-ups drop at random and every 5 binds in a row (max 3 each):", TEXT)],
+        [("   1  HELICASE    ", TEAL), ("slows the strand for 5 seconds", TEXT)],
+        [("   2  POLYMERASE  ", GOLD), ("autopilots your ship toward its site", TEXT)],
+        [],
+        [("Every 3 bases you bind form a ", TEXT), ("codon", TEAL), (" = one amino acid.", TEXT)],
+        [("A stop codon (TAA, TAG, TGA) releases the protein: ", TEXT), ("+5 per amino acid", MAGENTA)],
+        [],
+        [("DAILY CHALLENGE: ", MAGENTA), ("everyone starts from the same duplex today.", TEXT)],
+        [],
+        [("P", WHITE), (" pause    ", DIM), ("Q", WHITE), (" quit    Tip: run ", DIM), ("dnaplay --tutorial", WHITE),
+         (" to see this again", DIM)],
+    ]),
+]
+
+
+def polymer_lab(scr):
+    page = 0
+    while 0 <= page < len(POLYMER_GUIDE):
+        title, lines = POLYMER_GUIDE[page]
+
+        def paint(cv, t, title=title, lines=lines, page=page):
+            paint_stars(cv, t, 30)
+            cv.centre(2, "POLYMER LAB", GOLD)
+            cv.centre(4, title, TEAL)
+            left = max(2, (cv.cols - 78) // 2)
+            for n, segs in enumerate(lines):
+                cv.segments(left, 7 + n, segs)
+            cv.centre(cv.rows - 2, "[any key] close    [LEFT] back    [Q] quit", WHITE)
+        res = run_screen(scr, paint, {"left": "back", "q": "quit", "esc": "quit", "*": "close"})
+        if res in ("quit", "close"):
+            break
+        page += -1 if res == "back" else 1
+
+
+def tutorial(scr):
+    page = 0
+    while 0 <= page < len(TUTORIAL):
+        title, lines = TUTORIAL[page]
+
+        def paint(cv, t, title=title, lines=lines, page=page):
+            paint_stars(cv, t, 30)
+            cv.centre(2, "HOW TO PLAY  (%d/%d)" % (page + 1, len(TUTORIAL)), GOLD)
+            cv.centre(4, title, TEAL)
+            left = max(2, (cv.cols - 78) // 2)
+            for n, segs in enumerate(lines):
+                cv.segments(left, 7 + n, segs)
+            cv.centre(cv.rows - 2, "[any key] next    [LEFT] back    [Q] skip", WHITE)
+        res = run_screen(scr, paint, {"left": "back", "q": "skip", "esc": "skip", "*": "next"})
+        if res in ("skip", "quit"):
+            break
+        page += -1 if res == "back" else 1
+    try:
+        with open(SEEN_FILE, "a"):
+            pass
+    except OSError:
+        pass
+
+
+def play(scr, mode, seed, best, demo=False):
+    game = Game(mode, seed, best, demo)
+    paused, last_key, last = False, time.monotonic(), time.monotonic()
+    while True:
+        now = time.monotonic()
+        dt, last = min(0.1, now - last), now
+        cv = scr.canvas()
+        small = scr.too_small()
+        if not (paused or small or game.over):
+            game.update(dt, cv.cols, cv.rows)
+        if small:
+            cv.centre(cv.rows // 2, "Please make the window at least 80x24 (paused)", GOLD)
+        else:
+            game.draw(cv, paused)
+        scr.show()
+        if game.over:
+            cv = scr.canvas()
+            game.draw(cv)
+            cv.centre(cv.rows // 2, "  G A M E   O V E R  ", BAD)
+            scr.show()
+            time.sleep(1.5)
+            termios.tcflush(0, termios.TCIFLUSH)
+            return game
+        for k in read_keys(max(0.0, 1.0 / FPS - (time.monotonic() - now))):
+            last_key = time.monotonic()
+            if k in ("q", "esc"):
+                game.over, game.reason = True, "You quit."
+            elif k == "p":
+                paused = not paused
+            elif not paused:
+                game.key(k)
+        if not demo and time.monotonic() - last_key > IDLE_EXIT:
+            game.over, game.reason = True, "No key pressed for 2 minutes."
+
+
+def game_over_screen(scr, game, entries, me, new_best, top):
+    fact = random.choice(FACTS)
+
+    def paint(cv, t):
+        paint_stars(cv, t, 40)
+        cv.centre(1, "G A M E   O V E R", BAD)
+        cv.centre(2, game.reason, DIM)
+        cv.centre(4, "PEAK SCORE  %s" % fmt(game.peak), GOLD)
+        if top:
+            cv.centre(5, "*** NEW TOP SCIENTIST! ***", NEON[int(t * 6) % len(NEON)])
+        elif new_best:
+            cv.centre(5, "NEW PERSONAL BEST!", GOOD)
+        cv.centre(6, "binds %d   best combo %d   proteins %d" % (game.binds, game.best_streak, game.proteins), TEXT)
+        for n, line in enumerate(textwrap.wrap("Did you know?  " + fact, min(76, cv.cols - 4))):
+            cv.centre(8 + n, line, TEAL)
+        paint_boards(cv, 11, entries, me)
+        cv.centre(cv.rows - 2, "[ENTER] play again    [D] daily challenge    [Q] quit", WHITE)
+    return run_screen(scr, paint, {"enter": "play", "drop": "play", "d": "daily", "q": "quit", "esc": "quit"})
+
+
+# =============================================================================
+# 6. MAIN
+# =============================================================================
+def print_scores():
+    entries, source = load_scores()
+    for title, mode, n in (("TOP SCIENTISTS (classic)", "classic", 10),
+                           ("TODAY'S DAILY CHALLENGE", daily_tag(), 5)):
+        print(title)
+        rows = board(entries, mode, n)
+        if not rows:
+            print("   no scores yet")
+        for k, e in enumerate(rows):
+            print("  %2d. %-24s %10s" % (k + 1, e[1], fmt(e[0])))
+        print()
+    print("(source: %s)" % source)
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="dnaplay",
+        description="Base Pair Binder - a terminal DNA game",
+        epilog="Examples: dnaplay --tutorial | dnaplay --daily | dnaplay --demo | dnaplay --scores",
+    )
+    parser.add_argument("--daily", action="store_true", help="start a shared daily challenge")
+    parser.add_argument("--demo", action="store_true", help="watch the computer play")
+    parser.add_argument("--scores", action="store_true", help="print the scoreboard and exit")
+    parser.add_argument("--tutorial", action="store_true", help="show the tutorial before starting")
+    parser.add_argument("--version", action="version", version="%(prog)s 1.0")
+    return parser.parse_args(argv)
+
+
+def main(argv):
+    args = parse_args(argv)
+    if args.scores:
+        print_scores()
+        return 0
+    if not (os.isatty(0) and os.isatty(1)):
+        print("dnaplay needs an interactive terminal.")
+        return 1
+    lang = os.environ.get("LANG", "")
+    ctype = os.environ.get("LC_CTYPE", "")
+    if ctype.lower() in ("c.utf-8", "c.utf8") and lang in ("", "C", "POSIX"):
+        ctype = ""                                    # set by Python itself, not the user
+    if "utf" not in (os.environ.get("LC_ALL") or ctype or lang).lower():
+        print("dnaplay needs a UTF-8 locale, for example:  LANG=en_US.UTF-8 dnaplay")
+        return 1
+    cols, rows = terminal_size()
+    if cols < 80 or rows < 24:
+        print("Please make the window at least 80x24 (it is %dx%d)." % (cols, rows))
+        return 1
+    try:
+        os.nice(10)                                   # be polite on a shared server
+    except OSError:
+        pass
+    me = login_name()
+    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+    signal.signal(signal.SIGHUP, lambda s, f: sys.exit(0))
+    with TerminalGuard():
+        scr = Screen()
+        if not args.demo and (args.tutorial or not os.path.exists(SEEN_FILE)):
+            tutorial(scr)
+        choice = "demo" if args.demo else ("daily" if args.daily else None)
+        while True:
+            entries, source = load_scores()
+            if choice is None:
+                choice = title_screen(scr, entries, source, me)
+            if choice == "tutorial":
+                tutorial(scr)
+                choice = None
+                continue
+            if choice == "learn":
+                polymer_lab(scr)
+                choice = None
+                continue
+            if choice not in ("play", "daily", "demo"):
+                break
+            mode = daily_tag() if choice == "daily" else "classic"
+            seed = mode if choice == "daily" else None
+            best = personal_best(entries, me, mode)
+            top_before = max([e[0] for e in entries if e[2] == mode] + [0])
+            game = play(scr, mode, seed, best, demo=choice == "demo")
+            recorded = bool(game.binds and choice != "demo")
+            if recorded:
+                save_score(me, mode, game.peak, game.best_streak, game.proteins)
+            entries, source = load_scores()
+            choice = game_over_screen(scr, game, entries, me, game.peak > best and recorded,
+                                      game.peak > top_before and recorded)
+            if choice == "quit":
+                break
+    print("Thanks for playing, %s!  Scores: dnaplay --scores" % me)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(0)
